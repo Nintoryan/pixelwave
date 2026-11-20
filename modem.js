@@ -4,26 +4,31 @@
 // Tones: 1000 … 4937 Hz. Detection window 32 ms (bins 31.25 Hz) inside each 40 ms symbol.
 // Frame: 2 sync symbols + 15 data symbols (60 bytes = RS(60,44) codeword, scrambled).
 // User payload per frame: 42 bytes + CRC16. Frame time 0.68 s.
+// Quiet mode: 12 channels shifted up by 16 kHz → 17.0 … 19.9 kHz (near-ultrasonic), 20 data symbols, 0.88 s/frame.
+// The receiver high-passes and mixes that band down by 16 kHz, then uses the same detector.
 const Modem = (() => {
   const SR = 12000;          // internal receiver rate
   const HOP = 12;            // 1 ms at 12 kHz
   const N = 384;             // 32 ms DFT window → 31.25 Hz bins
   const SYM_MS = 40;         // symbol length in ms (= hops)
   const READ_MS = 37;        // window end, ms after symbol start (window covers 5..37 ms)
-  const CH = 16, TONES = 4, BIN0 = 32, BIN_STEP = 2;
-  const SYNC_SYMS = 2, DATA_SYMS = 15, FRAME_SYMS = SYNC_SYMS + DATA_SYMS;
+  const TONES = 4, BIN0 = 32, BIN_STEP = 2, SYNC_SYMS = 2;
   const CODE_BYTES = 60, NSYM = 16, DATA_BYTES = CODE_BYTES - NSYM, PAYLOAD = DATA_BYTES - 2;
-  const FRAME_SEC = FRAME_SYMS * SYM_MS / 1000;
-  const bin = (c, t) => BIN0 + BIN_STEP * (c * TONES + t);
-  const freq = (c, t) => bin(c, t) * SR / N;
-  const SYNC = [
-    Array.from({ length: CH }, (_, c) => (3 * c) % 4),
-    Array.from({ length: CH }, (_, c) => ((3 * c) % 4 + 2) % 4)
-  ];
+  const MODES = {};
+  for (const [name, ch, shift] of [['normal', 16, 0], ['quiet', 12, 16000]]) {
+    const dataSyms = CODE_BYTES / (ch / 4), frameSyms = SYNC_SYMS + dataSyms;
+    MODES[name] = {
+      name, ch, shift, bytesPerSym: ch / 4, dataSyms, frameSyms, frameSec: frameSyms * SYM_MS / 1000,
+      amp: shift ? 0.1 : 0.105 * Math.sqrt(16 / ch),
+      sync: [Array.from({ length: ch }, (_, c) => (3 * c) % 4), Array.from({ length: ch }, (_, c) => ((3 * c) % 4 + 2) % 4)],
+      freq: (c, t) => (BIN0 + BIN_STEP * (c * TONES + t)) * SR / N + shift
+    };
+  }
+  const FRAME_SEC = MODES.normal.frameSec;
   // Fixed pseudo-random scrambler and tone phases (identical on both sides).
   function prng(seed) { let s = seed >>> 0; return () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s; }; }
   const SCR = (() => { const r = prng(0x5eed1234); return Uint8Array.from({ length: CODE_BYTES }, () => r() & 255); })();
-  const PHASE = (() => { const r = prng(0x0badf00d); return Float64Array.from({ length: CH * TONES }, () => (r() / 4294967296) * 2 * Math.PI); })();
+  const PHASE = (() => { const r = prng(0x0badf00d); return Float64Array.from({ length: 16 * TONES }, () => (r() / 4294967296) * 2 * Math.PI); })();
 
   function crc16(a, n) {
     let c = 0xffff;
@@ -32,17 +37,18 @@ const Modem = (() => {
   }
 
   // payload: Uint8Array(PAYLOAD) → array of FRAME_SYMS symbols, each an array of CH tone indices.
-  function frameSymbols(payload) {
+  function frameSymbols(payload, mode) {
+    const M = MODES[mode || 'normal'], CH = M.ch, B = M.bytesPerSym;
     const d = new Uint8Array(DATA_BYTES);
     d.set(payload.subarray(0, PAYLOAD));
     const c = crc16(d, PAYLOAD); d[PAYLOAD] = c & 255; d[PAYLOAD + 1] = c >> 8;
     const cw = RS.encode(d, NSYM);
     for (let i = 0; i < CODE_BYTES; i++) cw[i] ^= SCR[i];
-    const syms = [SYNC[0], SYNC[1]];
-    for (let s = 0; s < DATA_SYMS; s++) {
+    const syms = [M.sync[0], M.sync[1]];
+    for (let s = 0; s < M.dataSyms; s++) {
       const tones = new Array(CH);
-      for (let j = 0; j < 4; j++) {
-        const b = cw[s * 4 + j];
+      for (let j = 0; j < B; j++) {
+        const b = cw[s * B + j];
         for (let k = 0; k < 4; k++) tones[j * 4 + k] = (b >> (6 - 2 * k)) & 3;
       }
       syms.push(tones);
@@ -52,25 +58,34 @@ const Modem = (() => {
 
   // Synthesize symbols (array of tone arrays) at sample rate sr.
   const SIN = (() => { const t = new Float32Array(4097); for (let i = 0; i <= 4096; i++) t[i] = Math.sin(2 * Math.PI * i / 4096); return t; })();
-  function synth(symList, sr) {
+  // opts.fadeIn: prepend a slow fade-in (avoids an audible click in quiet mode); opts.fadeOut: long release at the end.
+  function synth(symList, sr, mode, opts) {
+    const M = MODES[mode || 'normal'], CH = M.ch; opts = opts || {};
     const L = Math.round(sr * SYM_MS / 1000), R = Math.round(sr * 0.002);
-    const out = new Float32Array(symList.length * L + R);
-    const amp = 0.105;
+    const pre = opts.fadeIn ? Math.round(sr * 0.12) : 0, tail = opts.fadeOut ? Math.round(sr * 0.04) : R;
+    const out = new Float32Array(pre + symList.length * L + tail);
+    const amp = M.amp;
+    if (pre) for (let c = 0; c < CH; c++) {
+      const f = M.freq(c, M.sync[0][c]);
+      for (let i = 0; i < pre; i++) out[i] += amp * 0.5 * (1 - Math.cos(Math.PI * i / pre)) * Math.sin(2 * Math.PI * f * (i - pre) / sr + PHASE[c * TONES + M.sync[0][c]]);
+    }
     for (let s = 0; s < symList.length; s++) {
-      const tones = symList[s], base = s * L;
+      const tones = symList[s], base = pre + s * L, last = s === symList.length - 1, Rr = last ? tail : R;
       for (let c = 0; c < CH; c++) {
-        const t = tones[c], inc = freq(c, t) / sr * 4096;
-        let ph = PHASE[c * TONES + t] / (2 * Math.PI) * 4096 + inc * base; // continuous per-tone phase
-        ph %= 4096;
-        for (let i = 0; i < L + R; i++) {
-          const env = i < R ? 0.5 - 0.5 * Math.cos(Math.PI * i / R) : i >= L ? 0.5 + 0.5 * Math.cos(Math.PI * (i - L) / R) : 1;
+        const t = tones[c], inc = M.freq(c, t) / sr * 4096;
+        let ph = PHASE[c * TONES + t] / (2 * Math.PI) * 4096 + inc * (base - pre); // continuous per-tone phase
+        ph = ((ph % 4096) + 4096) % 4096;
+        const rise = (s === 0 && pre) ? 0 : R;
+        for (let i = 0; i < L + Rr; i++) {
+          const env = i < rise ? 0.5 - 0.5 * Math.cos(Math.PI * i / rise) : i >= L ? 0.5 + 0.5 * Math.cos(Math.PI * (i - L) / Rr) : 1;
           const idx = ph | 0;
           out[base + i] += amp * env * (SIN[idx] + (SIN[idx + 1] - SIN[idx]) * (ph - idx));
           ph += inc; if (ph >= 4096) ph -= 4096;
         }
       }
     }
-    for (let i = 0; i < out.length; i++) out[i] = 0.95 * Math.tanh(out[i] * 1.25);
+    if (M.shift) { for (let i = 0; i < out.length; i++) out[i] = Math.max(-0.98, Math.min(0.98, out[i])); } // stay linear: no audible intermod
+    else for (let i = 0; i < out.length; i++) out[i] = 0.95 * Math.tanh(out[i] * 1.25);
     return out;
   }
 
@@ -109,10 +124,39 @@ const Modem = (() => {
     }
   }
 
+  // Quiet-mode front end: high-pass (≈16 kHz), mix down by 16 kHz, then resample to 12 kHz.
+  class QuietFront {
+    constructor(sr, shift) {
+      this.ok = sr >= 40000; this.rs = new Resampler(sr); this.n = 0; this.w = 2 * Math.PI * shift / sr;
+      const taps = 2 * Math.round(2.75 * sr / 2000) + 1, fc = 16000 / sr, m = (taps - 1) / 2;
+      this.h = new Float32Array(taps);
+      for (let i = 0; i < taps; i++) {
+        const d = i - m, lp = d === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * d) / (Math.PI * d);
+        const win = 0.42 - 0.5 * Math.cos(2 * Math.PI * i / (taps - 1)) + 0.08 * Math.cos(4 * Math.PI * i / (taps - 1));
+        this.h[i] = ((d === 0 ? 1 : 0) - lp) * win;
+      }
+      this.hist = new Float32Array(taps - 1);
+    }
+    process(input) {
+      if (!this.ok) return new Float32Array(0);
+      const T = this.h.length, buf = new Float32Array(this.hist.length + input.length);
+      buf.set(this.hist); buf.set(input, this.hist.length);
+      const y = new Float32Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        let acc = 0; for (let k = 0; k < T; k++) acc += buf[i + k] * this.h[k];
+        y[i] = 2 * acc * Math.cos(this.w * this.n); this.n++;
+      }
+      if (this.n > 1e9) this.n = 0;
+      this.hist = buf.slice(buf.length - this.hist.length);
+      return this.rs.process(y);
+    }
+  }
+
   // Receiver: resample → sliding DFT on 64 bins → spectrogram (1 ms hops) → frame sync → RS decode.
-  const NB = CH * TONES, RING = 4096;
+  const RING = 4096;
   class Receiver {
-    constructor(onFrame, onStats) {
+    constructor(onFrame, onStats, mode) {
+      const M = this.M = MODES[mode || 'normal'], NB = this.NB = M.ch * TONES;
       this.onFrame = onFrame; this.onStats = onStats || (() => {});
       this.rs = null; this.sr = 0;
       this.x = new Float32Array(N); this.n = 0;
@@ -124,7 +168,8 @@ const Modem = (() => {
       this.cursor = N / HOP + 2; this.good = 0; this.bad = 0; this.level = 0; this.lastScore = 0;
     }
     feed(samples, sr) {
-      if (sr !== this.sr) { this.sr = sr; this.rs = new Resampler(sr); }
+      if (sr !== this.sr) { this.sr = sr; this.rs = this.M.shift ? new QuietFront(sr, this.M.shift) : new Resampler(sr); }
+      const NB = this.NB;
       const y = this.rs.process(samples);
       let e = 0;
       for (let i = 0; i < y.length; i++) {
@@ -144,8 +189,9 @@ const Modem = (() => {
       this.process();
       if (this.n - (this.statN || 0) > SR / 4) { this.statN = this.n; this.onStats({ good: this.good, bad: this.bad, level: this.level }); }
     }
-    E(h, j) { return this.spec[(h % RING) * NB + j]; }
+    E(h, j) { return this.spec[(h % RING) * this.NB + j]; }
     syncScore(t) {
+      const CH = this.M.ch, SYNC = this.M.sync;
       let s = 0;
       for (let q = 0; q < SYNC_SYMS; q++) {
         const h = t + q * SYM_MS + READ_MS;
@@ -157,7 +203,7 @@ const Modem = (() => {
       return s / (SYNC_SYMS * CH);
     }
     process() {
-      const TH = 0.62, span = FRAME_SYMS * SYM_MS;
+      const TH = 0.62, span = this.M.frameSyms * SYM_MS;
       let guard = 0;
       while (guard++ < 5000) {
         const t = this.cursor;
@@ -174,7 +220,7 @@ const Modem = (() => {
         const t0 = t + Math.round(st / sw);
         if (t0 + span + 2 >= this.hops) break; // wait for the whole frame
         const res = this.decodeAt(t0);
-        if (res) { this.good++; this.cursor = t0 + span - 12; this.onFrame(res.payload, res); }
+        if (res) { this.good++; this.cursor = t0 + span - 12; res.mode = this.M.name; this.onFrame(res.payload, res); }
         else { this.bad++; this.cursor = t + 4; }
         this.onStats({ good: this.good, bad: this.bad, level: this.level });
       }
@@ -187,17 +233,17 @@ const Modem = (() => {
       return null;
     }
     tryDecode(t0) {
-      const cw = new Uint8Array(CODE_BYTES), conf = new Float64Array(CODE_BYTES);
-      for (let s = 0; s < DATA_SYMS; s++) {
+      const cw = new Uint8Array(CODE_BYTES), conf = new Float64Array(CODE_BYTES), B = this.M.bytesPerSym;
+      for (let s = 0; s < this.M.dataSyms; s++) {
         const h = t0 + (SYNC_SYMS + s) * SYM_MS + READ_MS;
-        for (let j = 0; j < 4; j++) {
+        for (let j = 0; j < B; j++) {
           let b = 0, cmin = Infinity;
           for (let k = 0; k < 4; k++) {
             const c = j * 4 + k; let bi = 0, bv = -1, sv = 0;
             for (let t = 0; t < TONES; t++) { const v = this.E(h, c * TONES + t); if (v > bv) { sv = bv; bv = v; bi = t; } else if (v > sv) sv = v; }
             b = (b << 2) | bi; cmin = Math.min(cmin, bv / (Math.max(sv, 0) + 1e-12));
           }
-          cw[s * 4 + j] = b ^ SCR[s * 4 + j]; conf[s * 4 + j] = cmin;
+          cw[s * B + j] = b ^ SCR[s * B + j]; conf[s * B + j] = cmin;
         }
       }
       const order = [...Array(CODE_BYTES).keys()].sort((a, b) => conf[a] - conf[b]);
@@ -211,5 +257,5 @@ const Modem = (() => {
       return null;
     }
   }
-  return { SR, PAYLOAD, FRAME_SEC, SYM_MS, frameSymbols, synth, Receiver, crc16, freq };
+  return { SR, PAYLOAD, FRAME_SEC, SYM_MS, MODES, frameSymbols, synth, Receiver, crc16 };
 })();

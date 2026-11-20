@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 // Slider presets: [long side px, quality index]
 const PRESETS = [[32, 5], [40, 6], [48, 6], [64, 7], [80, 8], [96, 9], [128, 10], [160, 11], [192, 12], [256, 13], [320, 14]];
 const LEAD = 0.15, BATCH = 4;
-let image = null, encoded = null, session = 0, tx = null, rx = null, wakeLock = null;
+let mode = 'normal', image = null, encoded = null, session = 0, tx = null, rx = null, wakeLock = null;
 
 const say = s => { $('status').textContent = s; };
 function tab(isTx) {
@@ -34,6 +34,9 @@ $('file').onchange = async () => {
   } catch (e) { say('Ошибка: ' + e.message); }
 };
 let prepTimer = 0;
+try { if (localStorage.getItem('pw-quiet') === '1') { $('quiet').checked = true; mode = 'quiet'; } } catch (e) {}
+$('quiet').onchange = () => { mode = $('quiet').checked ? 'quiet' : 'normal'; try { localStorage.setItem('pw-quiet', $('quiet').checked ? '1' : '0'); } catch (e) {} prepare(); };
+const frameSec = () => Modem.MODES[mode].frameSec, preSec = () => mode === 'quiet' ? 0.12 : 0;
 $('level').oninput = () => { clearTimeout(prepTimer); prepTimer = setTimeout(prepare, 60); };
 
 function fit(w, h, L) {
@@ -71,7 +74,7 @@ function prepare() {
   const cv = $('preview'); cv.width = d.W; cv.height = d.H; cv.style.aspectRatio = d.W + '/' + d.H;
   cv.getContext('2d').putImageData(new ImageData(d.image(false), d.W, d.H), 0, 0);
   cv.classList.remove('hide'); $('emptyTx').classList.add('hide');
-  const secs = LEAD + encoded.chunks.length * Modem.FRAME_SEC + 0.1;
+  const secs = LEAD + preSec() + encoded.chunks.length * frameSec() + 0.1;
   $('estimate').innerHTML = `≈ ${fmtTime(secs)}<small>${d.W}×${d.H} px · ${encoded.chunks.length} пакетов</small>`;
   $('send').disabled = false; $('downloadWav').disabled = false;
 }
@@ -82,24 +85,25 @@ function framePayload(i) {
   p.set(c.bytes, 8);
   return p;
 }
-function batchWave(start, sr) {
-  const syms = [];
-  for (let i = start; i < Math.min(encoded.chunks.length, start + BATCH); i++) syms.push(...Modem.frameSymbols(framePayload(i)));
-  return Modem.synth(syms, sr);
+function batchWave(start, sr, m) {
+  const syms = [], end = Math.min(encoded.chunks.length, start + BATCH);
+  for (let i = start; i < end; i++) syms.push(...Modem.frameSymbols(framePayload(i), m));
+  return Modem.synth(syms, sr, m, { fadeIn: start === 0 && m === 'quiet', fadeOut: end === encoded.chunks.length });
 }
 $('send').onclick = async () => {
   if (!encoded || tx) return;
   const ctx = new AudioContext(); await ctx.resume();
-  const n = encoded.chunks.length, t0 = ctx.currentTime + LEAD + 0.05, total = n * Modem.FRAME_SEC;
+  const m = mode, fs = frameSec(), pre = preSec();
+  const n = encoded.chunks.length, t0 = ctx.currentTime + LEAD + 0.05 + pre, total = n * fs;
   tx = { ctx, sources: [], next: 0, stop: false };
-  $('send').classList.add('hide'); $('stopTx').classList.remove('hide'); $('level').disabled = true;
+  $('send').classList.add('hide'); $('stopTx').classList.remove('hide'); $('level').disabled = true; $('quiet').disabled = true;
   keepAwake(true);
   const pump = () => {
-    while (tx.next < n && t0 + tx.next * Modem.FRAME_SEC - ctx.currentTime < 3) {
-      const w = batchWave(tx.next, ctx.sampleRate), b = ctx.createBuffer(1, w.length, ctx.sampleRate);
+    while (tx.next < n && t0 + tx.next * fs - ctx.currentTime < 3) {
+      const w = batchWave(tx.next, ctx.sampleRate, m), b = ctx.createBuffer(1, w.length, ctx.sampleRate);
       b.copyToChannel(w, 0);
       const s = ctx.createBufferSource(); s.buffer = b; s.connect(ctx.destination);
-      s.start(t0 + tx.next * Modem.FRAME_SEC); tx.sources.push(s); tx.next += BATCH;
+      s.start(t0 + tx.next * fs - (tx.next === 0 ? pre : 0)); tx.sources.push(s); tx.next += BATCH;
     }
     const done = Math.min(1, Math.max(0, (ctx.currentTime - t0) / total));
     $('txBar').style.width = (done * 100) + '%';
@@ -112,20 +116,27 @@ function finishTx(msg) {
   if (!tx) return;
   clearInterval(tx.timer); tx.sources.forEach(s => { try { s.stop(); } catch (e) {} });
   tx.ctx.close().catch(() => {}); tx = null;
-  $('send').classList.remove('hide'); $('stopTx').classList.add('hide'); $('level').disabled = false;
+  $('send').classList.remove('hide'); $('stopTx').classList.add('hide'); $('level').disabled = false; $('quiet').disabled = false;
   $('txBar').style.width = '0'; keepAwake(false); say(msg);
 }
 $('stopTx').onclick = () => finishTx('Передача остановлена');
 
 // ---------- receiving ----------
 let dec = null, decKey = -1, lastFrameAt = 0, finalShown = false, drawPending = false;
+// Listen for both modes at once; the stronger band drives the signal meter.
 function newReceiver() {
-  return new Modem.Receiver(onFrame, st => {
+  const parts = {};
+  const show = () => {
+    const st = { good: 0, bad: 0, level: 0 };
+    for (const k in parts) { st.good += parts[k].good; st.bad += parts[k].bad; st.level = Math.max(st.level, parts[k].level * (k === 'quiet' ? 4 : 1)); }
     const bars = Math.max(0, Math.min(5, Math.round((Math.log10(st.level + 1e-6) + 3.2) * 2.2)));
     const meter = '<span class="meter">' + Array.from({ length: 5 }, (_, i) => `<span class="${i < bars ? 'on' : ''}"></span>`).join('') + '</span>';
-    $('rxStats').innerHTML = `Сигнал${meter} · пакетов ${st.good}` + (st.bad ? ` · сбоев ${st.bad}` : '');
-  });
+    $('rxStats').innerHTML = `Сигнал${meter} · пакетов ${st.good}` + (lastMode === 'quiet' ? ' · 🤫 тихий' : '');
+  };
+  const rs = ['normal', 'quiet'].map(m => new Modem.Receiver((p, r) => { lastMode = r.mode; onFrame(p); }, st => { parts[m] = st; show(); }, m));
+  return { feed: (x, sr) => { for (const r of rs) r.feed(x, sr); } };
 }
+let lastMode = null;
 function onFrame(p) {
   const sess = p[0], meta = p[1] | p[2] << 8, seq = p[3] | p[4] << 8;
   const first = p[5] | (p[6] & 15) << 8, off = (p[6] >> 4) | p[7] << 4;
@@ -205,9 +216,9 @@ function wavBlob(samples, sr) {
   return new Blob([b], { type: 'audio/wav' });
 }
 $('downloadWav').onclick = () => {
-  const sr = 48000, syms = []; encoded.chunks.forEach((_, i) => syms.push(...Modem.frameSymbols(framePayload(i))));
-  const w = Modem.synth(syms, sr), all = new Float32Array(w.length + sr); all.set(w, Math.round(sr * 0.3));
-  const a = document.createElement('a'); a.href = URL.createObjectURL(wavBlob(all, sr)); a.download = 'pixelwave-v6.wav'; a.click();
+  const sr = 48000, syms = []; encoded.chunks.forEach((_, i) => syms.push(...Modem.frameSymbols(framePayload(i), mode)));
+  const w = Modem.synth(syms, sr, mode, { fadeIn: mode === 'quiet', fadeOut: true }), all = new Float32Array(w.length + sr); all.set(w, Math.round(sr * 0.3));
+  const a = document.createElement('a'); a.href = URL.createObjectURL(wavBlob(all, sr)); a.download = `pixelwave-v6-${mode}.wav`; a.click();
 };
 $('wav').onchange = async () => {
   const f = $('wav').files[0]; if (!f) return;

@@ -28,6 +28,11 @@ button:disabled{opacity:.4;cursor:default}
 .slider input{width:100%;accent-color:#a7a1ff;height:28px}
 .slider .value{text-align:center;font-size:20px;font-weight:700;margin-top:6px}
 .slider .value small{display:block;font-size:13px;font-weight:500;color:#8d92aa;margin-top:2px}
+.toggle{display:flex;align-items:center;gap:12px;margin-top:14px;padding-top:14px;border-top:1px solid #2a2e3f;cursor:pointer}
+.toggle input{display:none}.toggle .sw{flex:none;width:46px;height:28px;border-radius:14px;background:#33374a;position:relative;transition:background .2s}
+.toggle .sw:after{content:'';position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .2s}
+.toggle input:checked+.sw{background:#a7a1ff}.toggle input:checked+.sw:after{left:21px}
+.toggle small{display:block;font-size:12.5px;color:#8d92aa;margin-top:2px;line-height:1.35}
 .bar{position:absolute;bottom:0;left:0;height:4px;background:#a7a1ff;transition:width .3s;width:0}
 #status{min-height:22px;font-size:15px;text-align:center;margin-top:16px;color:#d6d8e6}
 .stats{font-size:13px;text-align:center;color:#8d92aa;margin:10px 0}
@@ -53,6 +58,7 @@ button:disabled{opacity:.4;cursor:default}
       <div class="ends"><span>⚡ Быстрее</span><span>Качественнее ✨</span></div>
       <input type="range" id="level" min="0" max="10" step="1" value="1">
       <div class="value" id="estimate">—<small>выбери фото, чтобы увидеть время</small></div>
+      <label class="toggle"><input type="checkbox" id="quiet"><span class="sw"></span><span><b>🤫 Тихий режим</b><small>Неслышимый звук 17–20 кГц. Медленнее, телефоны держи ближе (10–30 см)</small></span></label>
     </div>
     <button id="send" class="primary" disabled>▶ Передать звуком</button>
     <button id="stopTx" class="secondary hide">Остановить</button>
