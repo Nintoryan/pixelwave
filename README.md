@@ -1,15 +1,18 @@
-# PixelWave v5
-Static client-only acoustic image transfer. Host all files together on HTTPS. Two devices must use v5.
+# PixelWave v6
+Передача фото звуком между двумя телефонами. Работает в браузере, без интернета и сервера. Оба устройства должны использовать v6.
 
-- Minimal send/receive interface; settings under gear.
-- JPEG compression on device, 192 px default.
-- Packetized 4-FSK at 16ms/symbol (125 raw bit/s, ~1.5x v4's raw symbol rate; actual payload speed varies).
-- Hamming(12,8) single-bit correction, per-packet CRC32 and file CRC32.
-- Systematic GF(256) Reed–Solomon **erasure coding** across 8 data shards plus 2/3/4 parity shards. A CRC-invalid packet is discarded; any 8 of the 11 shards in a group suffice with default parity. This does not directly correct arbitrary byte errors within a CRC-accepted shard.
-- Packet interleaving across groups and configurable repeat transmission.
-- AudioWorklet capture where available, ScriptProcessor fallback.
-- Progressive display best-effort: JPEG partial decoding depends on browser, full validated image appears on completion.
-- Offline PWA cache and WAV export/import.
-- Legacy Robot36 remains separate and is not part of v5 RS mode.
+**Интерфейс:** выбрать фото → ползунок «Быстрее ↔ Качественнее» → «Передать». На приёме картинка рисуется сверху вниз по мере поступления пакетов.
 
-Known limitations: physical handset-to-handset performance not measured; this is an experimental build. No bidirectional ACK/ARQ. Audio timing and decoder search may fail in noise, and microphone processing can distort tones. The transmitter requires an active foreground tab. Test with WAV first, then real devices. The first WAV packet is metadata, repeated with each pass; receiving it is necessary to finish the file.
+| Ползунок | Размер | Время (типичное фото) |
+|---|---|---|
+| самый быстрый | 32 px | ~4–6 с |
+| 2-я позиция | 40 px | ~5–9 с |
+| середина | 96 px | ~30–45 с |
+| максимум | 320 px | несколько минут |
+
+## Как устроено
+- **Модем:** 16 параллельных каналов 4-FSK (1–4.9 кГц), символ 40 мс → 800 бит/с «сырых». Кадр 0.68 с: 2 символа синхронизации + RS(60,44) с исправлением ошибок и стираний + CRC16. Полезная скорость ≈ 50 Б/с (в ~6 раз быстрее v5).
+- **Кодек:** свой потоковый DCT-кодек (Y 8×8 + Cb/Cr 4×4), таблицы Хаффмана обучены на фото. Поток режется на кадры; каждый кадр декодируется сразу и сам по себе, поэтому потеря кадра портит только его блоки. Пропуски в конце дорисовываются по соседям; повторная передача того же фото дополняет их.
+- Отладка: `index.html?debug`: экспорт и импорт WAV.
+
+Ограничения: обратного канала нет; надёжность на реальных телефонах зависит от громкости, расстояния и шумоподавления микрофона.

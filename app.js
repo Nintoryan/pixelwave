@@ -1,27 +1,220 @@
 'use strict';
-const $=id=>document.getElementById(id),M=Modem,K=8;let prepared=null,image=null,txContext=null,txStop=false,rxContext=null,rxStream=null,rxNode=null,rxSource=null,decoder=null,rxSession=null,rxGroups=new Map(),rxMeta=null,rxUrl=null,rxDone=false,rxCount=0,rxRunning=false;
-const say=s=>$('status').textContent=s,progress=v=>{$('bar').value=v;$('bar').classList.toggle('hide',v<=0||v>=100);$('liveProgress').style.width=v+'%'};
-$('gear').onclick=()=>$('settings').classList.toggle('hide');function tab(tx){$('tx').classList.toggle('hide',!tx);$('rx').classList.toggle('hide',tx);$('tabTx').classList.toggle('active',tx);$('tabRx').classList.toggle('active',!tx);say(tx?'Готово к передаче':'Готово к приёму')} $('tabTx').onclick=()=>tab(true);$('tabRx').onclick=()=>tab(false);
-$('file').onchange=async()=>{const f=$('file').files[0];if(!f)return;try{const url=URL.createObjectURL(f),img=new Image();await new Promise((ok,no)=>{img.onload=ok;img.onerror=no;img.src=url});URL.revokeObjectURL(url);image=img;await prepare()}catch(e){say('Ошибка изображения: '+e.message)}};
-for(const id of ['dimension','quality','parity','repeats'])$(id).oninput=()=>{$('qLabel').textContent=$('quality').value+'%';if(id==='dimension'||id==='quality')prepare();else estimate()};
-async function prepare(){if(!image)return;const max=+$('dimension').value,s=Math.min(1,max/Math.max(image.width,image.height)),w=Math.max(1,Math.round(image.width*s)),h=Math.max(1,Math.round(image.height*s)),c=document.createElement('canvas');c.width=w;c.height=h;c.getContext('2d').drawImage(image,0,0,w,h);const blob=await new Promise(ok=>c.toBlob(ok,'image/jpeg',+$('quality').value/100));if(!blob)throw Error('JPEG недоступен');prepared=new Uint8Array(await blob.arrayBuffer());$('preview').src=URL.createObjectURL(blob);$('preview').classList.remove('hide');$('emptyTx').classList.add('hide');$('choose').textContent='Изменить фото';$('send').classList.remove('hide');$('downloadWav').disabled=false;estimate()}
-function packetPlan(){if(!prepared)return null;const parity=+$('parity').value,groups=Math.ceil(prepared.length/(K*M.MAX)),total=groups*(K+parity);if(total>65535)throw Error('Слишком большое изображение');const session=crypto.getRandomValues(new Uint16Array(1))[0];const meta=new Uint8Array(12),v=new DataView(meta.buffer);v.setUint32(0,prepared.length,true);v.setUint32(4,M.crc32(prepared),true);v.setUint16(8,groups,true);v.setUint8(10,K);v.setUint8(11,parity);const frames=[M.packet(1,session,0,total,meta)];const groupPackets=[];for(let g=0;g<groups;g++){const data=[];for(let i=0;i<K;i++){const shard=new Uint8Array(M.MAX);shard.set(prepared.subarray((g*K+i)*M.MAX,(g*K+i+1)*M.MAX));data.push(shard)}const coded=RS.encode(data,parity);groupPackets.push(coded.map((a,i)=>M.packet(2,session,g*(K+parity)+i,total,a)))}// Interleave by shard position, so a short burst of noise does not wipe one group.
-for(let i=0;i<K+parity;i++)for(let g=0;g<groups;g++)frames.push(groupPackets[g][i]);return frames}
-function estimate(){if(!prepared)return;const p=+$('parity').value,g=Math.ceil(prepared.length/(K*M.MAX)),n=g*(K+p)+1,seconds=(M.SYNC.length+6*(M.HEADER+M.MAX+4))*M.DUR*n*(+$('repeats').value);$('estimate').textContent=`${Math.round(prepared.length/1024*10)/10} КБ · ≈ ${Math.ceil(seconds/60)} мин ${Math.round(seconds%60)} с · RS ${K}+${p}`}
-function blocks(){const a=packetPlan(),out=[];for(let r=0;r<+$('repeats').value;r++)for(const p of a)out.push(M.symbols(p));return out}
-function resample(wave,sr){if(sr===M.SR)return wave;const out=new Float32Array(Math.ceil(wave.length*sr/M.SR));for(let i=0;i<out.length;i++){const x=i*M.SR/sr,k=Math.floor(x),f=x-k;out[i]=(wave[k]||0)*(1-f)+(wave[k+1]||0)*f}return out}
-$('send').onclick=async()=>{txStop=false;$('send').disabled=true;$('stopTx').classList.remove('hide');try{const bs=blocks();txContext=new AudioContext();await txContext.resume();for(let i=0;i<bs.length&&!txStop;i++){const wave=resample(M.waveform(bs[i]),txContext.sampleRate),b=txContext.createBuffer(1,wave.length,txContext.sampleRate);b.copyToChannel(wave,0);const src=txContext.createBufferSource();src.buffer=b;src.connect(txContext.destination);await new Promise(ok=>{src.onended=ok;src.start()});progress((i+1)/bs.length*100);say(`Передаём · ${Math.round((i+1)/bs.length*100)}%`)}say(txStop?'Передача остановлена':'✓ Передача завершена')}catch(e){say('Ошибка: '+e.message)}finally{await txContext?.close().catch(()=>{});txContext=null;$('send').disabled=false;$('stopTx').classList.add('hide')}};
-$('stopTx').onclick=()=>{txStop=true};
-function wav(samples){const b=new ArrayBuffer(44+samples.length*2),v=new DataView(b);for(const [i,s] of [[0,'RIFF'],[8,'WAVE'],[12,'fmt '],[36,'data']])for(let j=0;j<s.length;j++)v.setUint8(i+j,s.charCodeAt(j));v.setUint32(4,b.byteLength-8,true);v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,M.SR,true);v.setUint32(28,M.SR*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);v.setUint32(40,samples.length*2,true);for(let i=0;i<samples.length;i++)v.setInt16(44+i*2,Math.round(Math.max(-1,Math.min(1,samples[i]))*32767),true);return new Blob([b],{type:'audio/wav'})}
-$('downloadWav').onclick=()=>{try{const bs=blocks(),n=bs.reduce((s,b)=>s+b.length*M.SPS,0);if(n>12e6)throw Error('WAV слишком большой');const wave=new Float32Array(n);let at=0;for(const b of bs){const a=M.waveform(b);wave.set(a,at);at+=a.length}const url=URL.createObjectURL(wav(wave)),a=document.createElement('a');a.href=url;a.download='pixelwave-v5.wav';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000)}catch(e){say(e.message)}};
-function reset(){rxSession=null;rxGroups=new Map();rxMeta=null;rxDone=false;rxCount=0;progress(0);$('save').classList.add('hide');$('received').classList.add('hide');$('emptyRx').classList.remove('hide');decoder=new M.Decoder(onPacket,s=>{$('rxStats').textContent=`Принято ${s.packets} · повреждено ${s.failed} · восстановлено групп ${completeGroups()}/${rxMeta?.groups||'?'}`})}
-function completeGroups(){let count=0;for(const g of rxGroups.values())if(g.data)count++;return count}
-function onPacket(p){if(rxDone)return;if(p.type===1&&p.payload.length===12){const v=new DataView(p.payload.buffer,p.payload.byteOffset,12),size=v.getUint32(0,true),groups=v.getUint16(8,true),k=v.getUint8(10),r=v.getUint8(11);if(k!==K||r<1||r>6||size>1000000||groups!==Math.ceil(size/(K*M.MAX))||p.total!==groups*(K+r))return;if(rxSession!==p.session){rxSession=p.session;rxGroups.clear()}rxMeta={size,crc:v.getUint32(4,true),groups,k,r};say('Получаем фото…');attempt();return}if(p.type!==2)return;if(rxSession===null){rxSession=p.session}else if(rxSession!==p.session)return;if(rxMeta&&p.total!==rxMeta.groups*(K+rxMeta.r))return;const n=rxMeta?K+rxMeta.r:K+ +$('parity').value,g=Math.floor(p.seq/n),index=p.seq%n;if(g>=65535||p.payload.length!==M.MAX)return;let group=rxGroups.get(g);if(!group){group={shards:new Map(),data:null};rxGroups.set(g,group)}group.shards.set(index,p.payload);if(rxMeta)attempt()}
-let renderPending=false;function attempt(){if(!rxMeta)return;const {groups,r,size}=rxMeta;for(let g=0;g<groups;g++){const group=rxGroups.get(g);if(!group||group.data||group.shards.size<K)continue;const shards=Array.from({length:K+r},(_,i)=>group.shards.get(i)||null);try{group.data=RS.recover(shards,K,r)}catch(e){group.data=null}}const completed=completeGroups();progress(completed/groups*100);$('rxStats').textContent=`Восстановлено ${completed}/${groups} блоков · Reed–Solomon ${K}+${r}`;if(completed===groups){const joined=new Uint8Array(size);for(let g=0;g<groups;g++){const data=rxGroups.get(g).data;for(let i=0;i<K;i++){const offset=(g*K+i)*M.MAX;if(offset<size)joined.set(data[i].subarray(0,Math.min(M.MAX,size-offset)),offset)}}if(M.crc32(joined)!==rxMeta.crc){say('CRC файла не совпала. Ждём дополнительные пакеты…');return}rxDone=true;showImage(joined,true)}else if(!renderPending){renderPending=true;setTimeout(()=>{renderPending=false;renderPartial()},500)}}
-function showImage(bytes,final){const blob=new Blob([bytes],{type:'image/jpeg'}),url=URL.createObjectURL(blob),im=new Image();im.onload=()=>{const c=$('received');c.width=im.naturalWidth;c.height=im.naturalHeight;c.getContext('2d').drawImage(im,0,0);c.classList.remove('hide');$('emptyRx').classList.add('hide');if(final){if(rxUrl)URL.revokeObjectURL(rxUrl);rxUrl=url;$('save').classList.remove('hide');say('✓ Фото получено без ошибок')}else URL.revokeObjectURL(url)};im.onerror=()=>URL.revokeObjectURL(url);im.src=url}
-function renderPartial(){if(!rxMeta||rxDone)return;const {size,groups}=rxMeta;const bytes=new Uint8Array(size);let g=0;while(g<groups&&rxGroups.get(g)?.data){for(let i=0;i<K;i++){const off=(g*K+i)*M.MAX;if(off<size)bytes.set(rxGroups.get(g).data[i].subarray(0,Math.min(M.MAX,size-off)),off)}g++}if(g>0){const upto=Math.min(size,g*K*M.MAX);showImage(bytes.subarray(0,upto),false)}}
-$('save').onclick=()=>{if(!rxUrl)return;const a=document.createElement('a');a.href=rxUrl;a.download='pixelwave.jpg';a.click()};
-$('listen').onclick=async()=>{try{if(!navigator.mediaDevices?.getUserMedia)throw Error('Нужен HTTPS');rxStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});rxContext=new AudioContext();await rxContext.resume();reset();rxSource=rxContext.createMediaStreamSource(rxStream);if(rxContext.audioWorklet){try{await rxContext.audioWorklet.addModule('capture-worklet.js');rxNode=new AudioWorkletNode(rxContext,'pixelwave-capture');rxNode.port.onmessage=e=>{if(rxRunning)decoder.feed(e.data,rxContext.sampleRate)}}catch(e){rxNode=null}}if(!rxNode){rxNode=rxContext.createScriptProcessor(2048,1,1);rxNode.onaudioprocess=e=>{e.outputBuffer.getChannelData(0).fill(0);if(rxRunning)decoder.feed(e.inputBuffer.getChannelData(0),rxContext.sampleRate)}}rxSource.connect(rxNode);const mute=rxContext.createGain();mute.gain.value=0;rxNode.connect(mute);mute.connect(rxContext.destination);rxRunning=true;$('listen').classList.add('hide');$('stopRx').classList.remove('hide');say('Слушаем. Запусти передачу на втором телефоне.')}catch(e){say('Микрофон: '+e.message);await stopRx()}};
-async function stopRx(){rxRunning=false;rxNode?.disconnect();rxSource?.disconnect();rxStream?.getTracks().forEach(t=>t.stop());await rxContext?.close().catch(()=>{});rxNode=rxSource=rxStream=rxContext=null;$('listen').classList.remove('hide');$('stopRx').classList.add('hide')}$('stopRx').onclick=async()=>{await stopRx();say('Приём остановлен')};
-$('wav').onchange=async()=>{const f=$('wav').files[0];if(!f)return;try{await stopRx();reset();const ctx=new AudioContext(),audio=await ctx.decodeAudioData(await f.arrayBuffer()),samples=audio.getChannelData(0);say('Обрабатываем WAV…');for(let i=0;i<samples.length;i+=2048){decoder.feed(samples.subarray(i,i+2048),audio.sampleRate);if(i%131072===0)await new Promise(ok=>setTimeout(ok,0))}await ctx.close();if(!rxDone)say(`WAV обработан · восстановлено ${completeGroups()}/${rxMeta?.groups||'?'} блоков`)}catch(e){say('Ошибка WAV: '+e.message)}};
-if('serviceWorker'in navigator&&location.protocol==='https:')navigator.serviceWorker.register('sw.js').catch(()=>{});
+const $ = id => document.getElementById(id);
+// Slider presets: [long side px, quality index]
+const PRESETS = [[32, 5], [40, 6], [48, 6], [64, 7], [80, 8], [96, 9], [128, 10], [160, 11], [192, 12], [256, 13], [320, 14]];
+const LEAD = 0.15, BATCH = 4;
+let image = null, encoded = null, session = 0, tx = null, rx = null, wakeLock = null;
+
+const say = s => { $('status').textContent = s; };
+function tab(isTx) {
+  $('tx').classList.toggle('hide', !isTx); $('rx').classList.toggle('hide', isTx);
+  $('tabTx').classList.toggle('active', isTx); $('tabRx').classList.toggle('active', !isTx);
+  say('');
+}
+$('tabTx').onclick = () => tab(true);
+$('tabRx').onclick = () => tab(false);
+if (/debug/.test(location.search)) $('debug').classList.remove('hide');
+
+async function keepAwake(on) {
+  try {
+    if (on && 'wakeLock' in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request('screen');
+    if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) { wakeLock = null; }
+}
+const fmtTime = s => s < 60 ? `${Math.max(1, Math.round(s))} с` : `${Math.floor(s / 60)} мин ${String(Math.round(s % 60)).padStart(2, '0')} с`;
+
+// ---------- sending ----------
+$('file').onchange = async () => {
+  const f = $('file').files[0]; if (!f) return;
+  try {
+    const url = URL.createObjectURL(f), img = new Image();
+    await new Promise((ok, no) => { img.onload = ok; img.onerror = () => no(Error('не удалось открыть')); img.src = url; });
+    URL.revokeObjectURL(url);
+    image = img; $('choose').textContent = 'Другое фото'; prepare();
+  } catch (e) { say('Ошибка: ' + e.message); }
+};
+let prepTimer = 0;
+$('level').oninput = () => { clearTimeout(prepTimer); prepTimer = setTimeout(prepare, 60); };
+
+function fit(w, h, L) {
+  let wu, hu;
+  if (w >= h) { wu = Math.max(1, Math.round(L / 8)); hu = Math.max(1, Math.round(wu * h / w)); }
+  else { hu = Math.max(1, Math.round(L / 8)); wu = Math.max(1, Math.round(hu * w / h)); }
+  return [Math.min(63, wu), Math.min(63, hu)];
+}
+function scaled(img, W, H) {
+  // centre-crop to the target aspect, then downscale in halving steps for a clean small image
+  const iw = img.naturalWidth, ih = img.naturalHeight, ta = W / H;
+  let sx = 0, sy = 0, sw = iw, sh = ih;
+  if (iw / ih > ta) { sw = Math.round(ih * ta); sx = (iw - sw) >> 1; } else { sh = Math.round(iw / ta); sy = (ih - sh) >> 1; }
+  let c = document.createElement('canvas'), w = sw, h = sh;
+  c.width = w; c.height = h; c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
+  while (w / 2 >= W * 1.5) {
+    const n = document.createElement('canvas'); n.width = Math.round(w / 2); n.height = Math.round(h / 2);
+    const g = n.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(c, 0, 0, n.width, n.height);
+    c = n; w = n.width; h = n.height;
+  }
+  const o = document.createElement('canvas'); o.width = W; o.height = H;
+  const g = o.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(c, 0, 0, W, H);
+  return g.getImageData(0, 0, W, H).data;
+}
+function prepare() {
+  if (!image || tx) return;
+  const [L, q] = PRESETS[+$('level').value];
+  const [wu, hu] = fit(image.naturalWidth, image.naturalHeight, L);
+  const rgba = scaled(image, wu * 8, hu * 8);
+  encoded = Codec.encode(rgba, wu, hu, q);
+  session = (Math.random() * 256) | 0;
+  // preview exactly what the receiver will get
+  const d = new Codec.Decoder(encoded.meta);
+  encoded.chunks.forEach((c, i) => d.addChunk(i, c.first, c.off, c.bytes));
+  const cv = $('preview'); cv.width = d.W; cv.height = d.H; cv.style.aspectRatio = d.W + '/' + d.H;
+  cv.getContext('2d').putImageData(new ImageData(d.image(false), d.W, d.H), 0, 0);
+  cv.classList.remove('hide'); $('emptyTx').classList.add('hide');
+  const secs = LEAD + encoded.chunks.length * Modem.FRAME_SEC + 0.1;
+  $('estimate').innerHTML = `≈ ${fmtTime(secs)}<small>${d.W}×${d.H} px · ${encoded.chunks.length} пакетов</small>`;
+  $('send').disabled = false; $('downloadWav').disabled = false;
+}
+function framePayload(i) {
+  const c = encoded.chunks[i], p = new Uint8Array(Modem.PAYLOAD);
+  p[0] = session; p[1] = encoded.meta & 255; p[2] = encoded.meta >> 8; p[3] = i & 255; p[4] = i >> 8;
+  p[5] = c.first & 255; p[6] = (c.first >> 8) | ((c.off & 15) << 4); p[7] = c.off >> 4;
+  p.set(c.bytes, 8);
+  return p;
+}
+function batchWave(start, sr) {
+  const syms = [];
+  for (let i = start; i < Math.min(encoded.chunks.length, start + BATCH); i++) syms.push(...Modem.frameSymbols(framePayload(i)));
+  return Modem.synth(syms, sr);
+}
+$('send').onclick = async () => {
+  if (!encoded || tx) return;
+  const ctx = new AudioContext(); await ctx.resume();
+  const n = encoded.chunks.length, t0 = ctx.currentTime + LEAD + 0.05, total = n * Modem.FRAME_SEC;
+  tx = { ctx, sources: [], next: 0, stop: false };
+  $('send').classList.add('hide'); $('stopTx').classList.remove('hide'); $('level').disabled = true;
+  keepAwake(true);
+  const pump = () => {
+    while (tx.next < n && t0 + tx.next * Modem.FRAME_SEC - ctx.currentTime < 3) {
+      const w = batchWave(tx.next, ctx.sampleRate), b = ctx.createBuffer(1, w.length, ctx.sampleRate);
+      b.copyToChannel(w, 0);
+      const s = ctx.createBufferSource(); s.buffer = b; s.connect(ctx.destination);
+      s.start(t0 + tx.next * Modem.FRAME_SEC); tx.sources.push(s); tx.next += BATCH;
+    }
+    const done = Math.min(1, Math.max(0, (ctx.currentTime - t0) / total));
+    $('txBar').style.width = (done * 100) + '%';
+    say(`Передаём · осталось ${fmtTime(Math.max(0, total * (1 - done)))}`);
+    if (done >= 1 && ctx.currentTime > t0 + total + 0.1) finishTx('✓ Передача завершена');
+  };
+  tx.timer = setInterval(pump, 150); pump();
+};
+function finishTx(msg) {
+  if (!tx) return;
+  clearInterval(tx.timer); tx.sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  tx.ctx.close().catch(() => {}); tx = null;
+  $('send').classList.remove('hide'); $('stopTx').classList.add('hide'); $('level').disabled = false;
+  $('txBar').style.width = '0'; keepAwake(false); say(msg);
+}
+$('stopTx').onclick = () => finishTx('Передача остановлена');
+
+// ---------- receiving ----------
+let dec = null, decKey = -1, lastFrameAt = 0, finalShown = false, drawPending = false;
+function newReceiver() {
+  return new Modem.Receiver(onFrame, st => {
+    const bars = Math.max(0, Math.min(5, Math.round((Math.log10(st.level + 1e-6) + 3.2) * 2.2)));
+    const meter = '<span class="meter">' + Array.from({ length: 5 }, (_, i) => `<span class="${i < bars ? 'on' : ''}"></span>`).join('') + '</span>';
+    $('rxStats').innerHTML = `Сигнал${meter} · пакетов ${st.good}` + (st.bad ? ` · сбоев ${st.bad}` : '');
+  });
+}
+function onFrame(p) {
+  const sess = p[0], meta = p[1] | p[2] << 8, seq = p[3] | p[4] << 8;
+  const first = p[5] | (p[6] & 15) << 8, off = (p[6] >> 4) | p[7] << 4;
+  const m = Codec.unmeta(meta);
+  if (!m.wu || !m.hu) return;
+  const key = sess << 16 | meta;
+  if (key !== decKey) {
+    dec = new Codec.Decoder(meta); decKey = key; finalShown = false;
+    const cv = $('received'); cv.width = dec.W; cv.height = dec.H; cv.style.aspectRatio = dec.W + '/' + dec.H;
+    const g = cv.getContext('2d'); g.fillStyle = '#10121a'; g.fillRect(0, 0, dec.W, dec.H);
+    cv.classList.remove('hide'); $('emptyRx').classList.add('hide'); $('save').classList.add('hide');
+  }
+  lastFrameAt = performance.now();
+  if (dec.addChunk(seq, first, off, p.subarray(8, 8 + Codec.CHUNK))) scheduleDraw();
+  const pct = Math.round(dec.count / dec.units * 100);
+  $('rxBar').style.width = pct + '%';
+  if (dec.count === dec.units) { say('✓ Фото получено'); finalShown = true; $('save').classList.remove('hide'); }
+  else say(`Принимаем · ${pct}%`);
+}
+function scheduleDraw() {
+  if (drawPending) return; drawPending = true;
+  requestAnimationFrame(() => { drawPending = false; draw(false); });
+}
+function draw(fill) {
+  if (!dec) return;
+  $('received').getContext('2d').putImageData(new ImageData(dec.image(fill), dec.W, dec.H), 0, 0);
+}
+setInterval(() => {
+  // once frames stop arriving, fill the holes so the picture looks complete
+  if (dec && !finalShown && lastFrameAt && performance.now() - lastFrameAt > 2500 && dec.count < dec.units) {
+    finalShown = true; draw(true); $('save').classList.remove('hide');
+    say(`Получено ${Math.round(dec.count / dec.units * 100)}% · пропуски дорисованы. Повтори передачу, чтобы дополнить`);
+  }
+}, 500);
+$('listen').onclick = async () => {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw Error('нужен HTTPS');
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+    const ctx = new AudioContext(); await ctx.resume();
+    const receiver = newReceiver(), src = ctx.createMediaStreamSource(stream);
+    let node = null;
+    if (ctx.audioWorklet) {
+      try { await ctx.audioWorklet.addModule('capture-worklet.js'); node = new AudioWorkletNode(ctx, 'pixelwave-capture'); node.port.onmessage = e => receiver.feed(e.data, ctx.sampleRate); }
+      catch (e) { node = null; }
+    }
+    if (!node) { node = ctx.createScriptProcessor(2048, 1, 1); node.onaudioprocess = e => { e.outputBuffer.getChannelData(0).fill(0); receiver.feed(e.inputBuffer.getChannelData(0), ctx.sampleRate); }; }
+    const mute = ctx.createGain(); mute.gain.value = 0;
+    src.connect(node); node.connect(mute); mute.connect(ctx.destination);
+    rx = { ctx, stream, node, src };
+    $('listen').classList.add('hide'); $('stopRx').classList.remove('hide');
+    keepAwake(true); say('Слушаем… Запусти передачу на другом телефоне');
+  } catch (e) { say('Микрофон: ' + e.message); }
+};
+async function stopRx() {
+  if (!rx) return;
+  rx.node.disconnect(); rx.src.disconnect(); rx.stream.getTracks().forEach(t => t.stop());
+  await rx.ctx.close().catch(() => {}); rx = null;
+  $('listen').classList.remove('hide'); $('stopRx').classList.add('hide'); keepAwake(false);
+}
+$('stopRx').onclick = async () => { await stopRx(); if (dec && dec.count < dec.units) draw(true); say('Приём остановлен'); };
+$('save').onclick = () => {
+  if (!dec) return;
+  // save upscaled so the small picture is usable
+  const k = Math.max(1, Math.ceil(512 / Math.max(dec.W, dec.H))), src = $('received');
+  const c = document.createElement('canvas'); c.width = dec.W * k; c.height = dec.H * k;
+  const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(src, 0, 0, c.width, c.height);
+  c.toBlob(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'pixelwave.png'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 30000); }, 'image/png');
+};
+
+// ---------- debug: WAV ----------
+function wavBlob(samples, sr) {
+  const b = new ArrayBuffer(44 + samples.length * 2), v = new DataView(b);
+  for (const [i, s] of [[0, 'RIFF'], [8, 'WAVE'], [12, 'fmt '], [36, 'data']]) for (let j = 0; j < 4; j++) v.setUint8(i + j, s.charCodeAt(j));
+  v.setUint32(4, b.byteLength - 8, true); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); v.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) v.setInt16(44 + i * 2, Math.round(Math.max(-1, Math.min(1, samples[i])) * 32767), true);
+  return new Blob([b], { type: 'audio/wav' });
+}
+$('downloadWav').onclick = () => {
+  const sr = 48000, syms = []; encoded.chunks.forEach((_, i) => syms.push(...Modem.frameSymbols(framePayload(i))));
+  const w = Modem.synth(syms, sr), all = new Float32Array(w.length + sr); all.set(w, Math.round(sr * 0.3));
+  const a = document.createElement('a'); a.href = URL.createObjectURL(wavBlob(all, sr)); a.download = 'pixelwave-v6.wav'; a.click();
+};
+$('wav').onchange = async () => {
+  const f = $('wav').files[0]; if (!f) return;
+  const ctx = new AudioContext(), audio = await ctx.decodeAudioData(await f.arrayBuffer()), s = audio.getChannelData(0);
+  const r = newReceiver(); tab(false);
+  for (let i = 0; i < s.length; i += 4096) { r.feed(s.subarray(i, i + 4096), audio.sampleRate); if (i % 65536 === 0) await new Promise(ok => setTimeout(ok, 0)); }
+  ctx.close();
+};
+
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
